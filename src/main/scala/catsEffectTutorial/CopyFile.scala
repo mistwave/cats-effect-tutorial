@@ -17,65 +17,85 @@ package catsEffectTutorial
 
 import cats.effect._
 import cats.effect.concurrent.Semaphore
-import cats.implicits._ 
-import java.io._ 
+import cats.implicits._
+import java.io._
+import scala.io.StdIn
 
 object CopyFile extends IOApp {
 
-  def transmit(origin: InputStream, destination: OutputStream, buffer: Array[Byte], acc: Long): IO[Long] =
+  def transmit[F[_] : Sync](origin: InputStream, destination: OutputStream, buffer: Array[Byte], acc: Long): F[Long] =
     for {
-      amount <- IO(origin.read(buffer, 0, buffer.length))
-      count  <- if(amount > -1) IO(destination.write(buffer, 0, amount)) >> transmit(origin, destination, buffer, acc + amount)
-                else IO.pure(acc) // End of read stream reached (by java.io.InputStream contract), nothing to write
+      amount <- Sync[F].delay(origin.read(buffer, 0, buffer.length))
+      count <- if (amount > -1) Sync[F].delay(destination.write(buffer, 0, amount)) >> transmit(origin, destination, buffer, acc + amount)
+      else Sync[F].pure(acc) // End of read stream reached (by java.io.InputStream contract), nothing to write
     } yield count // Returns the actual amount of bytes transmitted
 
-  def transfer(origin: InputStream, destination: OutputStream): IO[Long] =
+
+  def transfer[F[_] : Sync](origin: InputStream, destination: OutputStream): F[Long] =
     for {
-      buffer <- IO{ new Array[Byte](1024 * 10) } // Allocated only when the IO is evaluated
-      total  <- transmit(origin, destination, buffer, 0L)
+      buffer <- Sync[F].delay {
+        new Array[Byte](1024 * 10)
+      } // Allocated only when the IO is evaluated
+      total <- transmit(origin, destination, buffer, 0L)
     } yield total
 
-  def inputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileInputStream] =
+  def inputStream[F[_] : Sync](f: File, guard: Semaphore[F]): Resource[F, FileInputStream] =
     Resource.make {
-      IO(new FileInputStream(f))
-    } { inStream => 
+      Sync[F].delay(new FileInputStream(f))
+    } { inStream =>
       guard.withPermit {
-       IO(inStream.close()).handleErrorWith(_ => IO.unit)
+        Sync[F].delay(inStream.close()).handleErrorWith(_ => Sync[F].unit)
       }
     }
 
-  def outputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileOutputStream] =
+  def outputStream[F[_] : Sync](f: File, guard: Semaphore[F]): Resource[F, FileOutputStream] =
     Resource.make {
-      IO(new FileOutputStream(f))
+      Sync[F].delay(new FileOutputStream(f))
     } { outStream =>
       guard.withPermit {
-       IO(outStream.close()).handleErrorWith(_ => IO.unit)
+        Sync[F].delay(outStream.close()).handleErrorWith(_ => Sync[F].unit)
       }
     }
 
-  def inputOutputStreams(in: File, out: File, guard: Semaphore[IO]): Resource[IO, (InputStream, OutputStream)] =
+  def inputOutputStreams[F[_] : Sync](in: File, out: File, guard: Semaphore[F]): Resource[F, (InputStream, OutputStream)] =
     for {
-      inStream  <- inputStream(in, guard)
+      inStream <- inputStream(in, guard)
       outStream <- outputStream(out, guard)
     } yield (inStream, outStream)
 
-  def copy(origin: File, destination: File): IO[Long] = 
+  def copy[F[_] : Concurrent](origin: File, destination: File): F[Long] =
     for {
-      guard <- Semaphore[IO](1)
-      count <- inputOutputStreams(origin, destination, guard).use { case (in, out) => 
-                 guard.withPermit(transfer(in, out))
-               }
+      guard <- Semaphore[F](1)
+      count <- inputOutputStreams(origin, destination, guard).use { case (in, out) =>
+        guard.withPermit(transfer(in, out))
+      }
     } yield count
 
   // The 'main' function of IOApp //
-  override def run(args: List[String]): IO[ExitCode] =
+  override def run(args: List[String]): IO[ExitCode] = {
     for {
-      _      <- if(args.length < 2) IO.raiseError(new IllegalArgumentException("Need origin and destination files"))
-                else IO.unit
+      _ <- validateArgsE(args) match {
+        case Left(e) => IO.raiseError(e)
+        case _ => IO.unit
+      }
       orig = new File(args.head)
       dest = new File(args.tail.head)
-      count <- copy(orig, dest)
-      _     <- IO(println(s"$count bytes copied from ${orig.getPath} to ${dest.getPath}"))
+      _ <- if (orig.canRead) IO.unit else IO.raiseError(new IllegalArgumentException("origin file cannot be read from"))
+      _ <- if (dest.canWrite) IO.unit else IO.raiseError(new IllegalArgumentException("destination file cannot be written to"))
+      iow <- IO(StdIn.readLine("Destination file existed, [Y]es to OVERWRITE: "))
+      _ <- iow match {
+        case "Y" =>
+          copy[IO](orig, dest).flatMap(count =>
+            IO(println(s"$count bytes copied from ${orig.getPath} to ${dest.getPath}")))
+        case _ => IO.unit
+      }
     } yield ExitCode.Success
+  }
+
+  def validateArgsE(args: List[String]): Either[Exception, Unit] = args match {
+    case _ if args.length < 2 => Left(new IllegalArgumentException("Need origin and destination files"))
+    case _ if args.head == args(1) => Left(new IllegalArgumentException("Origin and destination cannot be the same"))
+    case _ => Right()
+  }
 
 }
